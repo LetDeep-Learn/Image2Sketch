@@ -6,31 +6,26 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch import amp
 from torch.optim.lr_scheduler import LambdaLR
-from peft import get_peft_model_state_dict
-
 from config import cfg
-from dataset import ImageDataset, collate_fn
+from old_cap_dataset import ImageDataset, collate_fn
 from model import (
     load_base_pipeline,
     inject_lora_to_unet_by_replacing_linears,
     collect_lora_parameters_from_unet,
-    save_lora_state,
 )
 
+# ---------------------------
+# Utils
+# ---------------------------
 def seed_everything(seed=42):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def save_lora_state_from_unet(unet: torch.nn.Module, path: str):
-    """
-    Save only the LoRA adapter weights from a UNet that has LoRALinear modules injected.
-    File format: dict[module_name] = {"lora_up": {...}, "lora_down": {...}}
-    All tensors are moved to CPU before saving.
-    """
-    sd: Dict[str, Dict] = {}
+def save_checkpoint(unet, optimizer, scheduler, scaler, global_step, path):
+    """Save LoRA + optimizer/lr/scaler state"""
+    lora_state = {}
     for name, module in unet.named_modules():
-        # detect our wrapper class by attribute names
         if hasattr(module, "lora_up") or hasattr(module, "lora_down"):
             entry = {}
             if getattr(module, "lora_down", None) is not None:
@@ -38,38 +33,43 @@ def save_lora_state_from_unet(unet: torch.nn.Module, path: str):
             if getattr(module, "lora_up", None) is not None:
                 entry["lora_up"] = {k: v.cpu() for k, v in module.lora_up.state_dict().items()}
             if entry:
-                sd[name] = entry
-    if len(sd) == 0:
-        raise RuntimeError("No LoRA adapter modules found inside UNet to save.")
-    torch.save(sd, path)
-    print(f"[INFO] Saved LoRA adapters ({len(sd)} modules) to {path}")
+                lora_state[name] = entry
 
-def load_lora_state_to_unet(unet: torch.nn.Module, path: str, map_location="cpu"):
-    """
-    Load LoRA adapter weights saved by save_lora_state_from_unet into the current UNet.
-    Matches by module name. Warns about any saved module names not found.
-    """
-    sd = torch.load(path, map_location=map_location)
-    missing = []
-    loaded = []
-    for saved_name, entry in sd.items():
-        found = False
+    torch.save({
+        "step": global_step,
+        "lora": lora_state,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+    }, path)
+    print(f"[INFO] Saved checkpoint at {path} (step {global_step})")
+
+def load_checkpoint(unet, optimizer, scheduler, scaler, path, device):
+    """Restore LoRA + optimizer/lr/scaler state"""
+    ckpt = torch.load(path, map_location=device)
+
+    # Restore LoRA weights
+    for saved_name, entry in ckpt["lora"].items():
         for name, module in unet.named_modules():
             if name == saved_name:
-                # expected to be LoRALinear-like module
                 if getattr(module, "lora_down", None) is not None and "lora_down" in entry:
                     module.lora_down.load_state_dict(entry["lora_down"])
                 if getattr(module, "lora_up", None) is not None and "lora_up" in entry:
                     module.lora_up.load_state_dict(entry["lora_up"])
-                found = True
-                loaded.append(saved_name)
                 break
-        if not found:
-            missing.append(saved_name)
-    if missing:
-        print("[WARNING] Some saved LoRA modules were not matched in the current UNet:", missing)
-    print(f"[INFO] Loaded LoRA adapters: {len(loaded)} modules from {path}")
-    return loaded
+
+    # Restore training states
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    scaler.load_state_dict(ckpt["scaler"])
+    step = ckpt["step"]
+
+    print(f"[INFO] Resumed training from step {step} (loaded {path})")
+    return step
+
+# ---------------------------
+# Training
+# ---------------------------
 def main():
     seed_everything(cfg.SEED)
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
@@ -91,7 +91,7 @@ def main():
     for p in vae.parameters():
         p.requires_grad = False
 
-    lora_map = inject_lora_to_unet_by_replacing_linears(
+    inject_lora_to_unet_by_replacing_linears(
         unet, r=cfg.LORA_RANK, alpha=cfg.LORA_ALPHA, dropout=cfg.LORA_DROPOUT
     )
     trainable_params, trainable_names = collect_lora_parameters_from_unet(unet)
@@ -109,23 +109,17 @@ def main():
             return max(0.0, float(cfg.MAX_STEPS - step) / float(max(1, cfg.MAX_STEPS - cfg.WARMUP_STEPS)))
     scheduler = LambdaLR(optimizer, lr_lambda)
 
-    # Use dataset that only returns images
     dataset = ImageDataset(cfg.DATA_DIR, img_size=cfg.IMG_SIZE)
     dataloader = DataLoader(dataset, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=collate_fn, drop_last=True)
 
     scaler = amp.GradScaler(enabled=(cfg.MIXED_PRECISION != "no"))
 
-    # === Resume logic ===
+    # ---------------------------
+    # Resume logic
+    # ---------------------------
     global_step = 0
-    latest_ckpt = None
-    ckpt_files = [f for f in os.listdir(cfg.OUTPUT_DIR) if f.startswith("lora_checkpoint_step_") and f.endswith(".pt")]
-    if ckpt_files:
-        ckpt_steps = [int(f.split("_")[-1].replace(".pt", "")) for f in ckpt_files]
-        latest_step = max(ckpt_steps)
-        latest_ckpt = os.path.join(cfg.OUTPUT_DIR, f"lora_checkpoint_step_{latest_step}.pt")
-        load_lora_state_to_unet(unet, latest_ckpt, map_location=cfg.DEVICE)
-        global_step = latest_step
-        print(f"[INFO] Resumed from {latest_ckpt}, starting at step {global_step}")
+    if hasattr(cfg, "RESUME_PATH") and cfg.RESUME_PATH and os.path.exists(cfg.RESUME_PATH):
+        global_step = load_checkpoint(unet, optimizer, scheduler, scaler, cfg.RESUME_PATH, cfg.DEVICE)
 
     pbar = tqdm(total=cfg.MAX_STEPS, initial=global_step)
     try:
@@ -133,6 +127,9 @@ def main():
     except Exception:
         pass
 
+    # ---------------------------
+    # Training loop
+    # ---------------------------
     for epoch in range(100000):
         for batch in dataloader:
             if global_step >= cfg.MAX_STEPS:
@@ -157,7 +154,6 @@ def main():
 
             optimizer.zero_grad()
             with amp.autocast(device_type="cuda", enabled=(cfg.MIXED_PRECISION != "no")):
-                # Empty text embeddings → unconditional
                 batch_size = latents.shape[0]
                 hidden_size = unet.config.cross_attention_dim
                 text_embeddings = torch.zeros(
@@ -174,7 +170,7 @@ def main():
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 except ValueError:
-                    print("[WARNING] scaler.unscale_ failed (likely FP16 grads). Skipping gradient clipping for this step.")
+                    print("[WARNING] scaler.unscale_ failed. Skipping grad clipping.")
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -185,7 +181,7 @@ def main():
 
             if global_step % cfg.CHECKPOINT_EVERY == 0 or global_step >= cfg.MAX_STEPS:
                 ckpt_path = os.path.join(cfg.OUTPUT_DIR, f"lora_checkpoint_step_{global_step}.pt")
-                save_lora_state(unet, ckpt_path)
+                save_checkpoint(unet, optimizer, scheduler, scaler, global_step, ckpt_path)
 
             if global_step >= cfg.MAX_STEPS:
                 break
@@ -195,10 +191,9 @@ def main():
 
     if cfg.SAVE_FINAL:
         final_path = os.path.join(cfg.OUTPUT_DIR, "lora_final.pt")
-        save_lora_state(unet, final_path)
+        save_checkpoint(unet, optimizer, scheduler, scaler, global_step, final_path)
 
     print("Training finished. LoRA saved to", cfg.OUTPUT_DIR)
-
 
 if __name__ == "__main__":
     main()
