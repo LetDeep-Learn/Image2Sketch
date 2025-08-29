@@ -6,7 +6,7 @@ MODEL_ID = "runwayml/stable-diffusion-v1-5"
 
 # Data
 DATA_DIR = "data/sketches"      # in repo (read-only) or mount drive path
-EVAL_PHOTOS_DIR = "data/photos" # optional for evaluation
+EVAL_PHOTOS_DIR = "data/images" # optional for evaluation
 
 # Output / checkpoints
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/content/drive/MyDrive/sd_lora_sketch")  # default to Drive mount
