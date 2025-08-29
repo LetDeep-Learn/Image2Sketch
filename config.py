@@ -1,35 +1,31 @@
-# config.py
 import os
+from dataclasses import dataclass
 
-# Model / HF
-MODEL_ID = "runwayml/stable-diffusion-v1-5"
+@dataclass
+class Config:
+    MODEL_ID = "runwayml/stable-diffusion-v1-5"
+    HF_TOKEN = None
 
-# Data
-DATA_DIR = "data/sketches"      # in repo (read-only) or mount drive path
-EVAL_PHOTOS_DIR = "data/images" # optional for evaluation
+    DATA_DIR = "dataset"
+    CAPTIONS_TXT = None
+    OUTPUT_DIR = "output"
 
-# Output / checkpoints
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/content/drive/MyDrive/sd_lora_sketch")  # default to Drive mount
-CHECKPOINT_EVERY = 1000
+    DEVICE = "cuda"
+    IMG_SIZE = 512
+    BATCH_SIZE = 2
+    LR = 1e-4
+    MAX_STEPS = 2000
+    WARMUP_STEPS = 50
+    CHECKPOINT_EVERY = 500
+    MIXED_PRECISION = "fp16"
+    GRAD_ACCUMULATE = 1
+    SEED = 42
 
-# Training hyperparams
-IMG_SIZE = 512
-BATCH_SIZE = 1                  # T4 can be tight; set 1 or 2
-GRAD_ACCUM_STEPS = 1
-LR = 1e-4
-MAX_STEPS = 5000
-WARMUP_STEPS = 200
-LORA_RANK = 8
+    LORA_RANK = 4
+    LORA_ALPHA = 16
+    LORA_DROPOUT = 0.0
 
-# Precision & device
-MIXED_PRECISION = "fp16"        # use "fp16" on Colab GPU
-DEVICE = "cuda"
+    SCHEDULER = "ddpm"
+    SAVE_FINAL = True
 
-# Caption used during LoRA training (style prompt)
-TRAINING_CAPTION = "pencil sketch, clean line art, black and white, no shading, high contrast"
-
-# Inference defaults
-INFER_PROMPT = "pencil sketch, clean line art, black and white"
-INFER_STRENGTH = 0.55
-INFER_GUIDANCE = 7.5
-INFER_STEPS = 30
+cfg = Config()

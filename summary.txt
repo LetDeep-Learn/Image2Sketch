@@ -119,6 +119,3 @@ Key Concepts:
 
 ---
 
-This is the complete plain-text summary of your project.
-
-Do you want me to now also prepare the plain-text version of inference.py that matches this setup?

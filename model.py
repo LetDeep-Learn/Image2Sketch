@@ -1,57 +1,80 @@
-# model.py
 import torch
 from diffusers import StableDiffusionPipeline, DDPMScheduler
-from diffusers.models.attention_processor import LoRAAttnProcessor2_0
-from diffusers.loaders import AttnProcsLayers
 
-def load_base_pipeline(model_id, device="cuda", dtype=torch.float16):
-    """
-    Load Stable Diffusion pipeline with scheduler set for training.
-    Compatible with latest diffusers.
-    """
+def load_base_pipeline(model_id, device="cuda", dtype=torch.float16, use_auth_token=None):
     pipe = StableDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=dtype,
-        safety_checker=None  # disable NSFW filter for training
+        safety_checker=None,
+        use_auth_token=use_auth_token,
     )
-    pipe = pipe.to(device)
+    try:
+        pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+    except Exception:
+        pass
 
-    # Use DDPM scheduler for training
-    pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
-
-    # Memory helpers
-    pipe.enable_vae_tiling()
-    pipe.enable_attention_slicing()
+    pipe.to(device)
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception:
+        pass
+    try:
+        pipe.enable_attention_slicing()
+    except Exception:
+        pass
+    try:
+        pipe.vae.enable_vae_slicing()
+    except Exception:
+        pass
     return pipe
 
+def get_lora_attn_processor_class():
+    try:
+        from diffusers.models.attention_processor import LoRAAttnProcessor
+        return LoRAAttnProcessor
+    except Exception as e:
+        raise ImportError("LoRAAttnProcessor not found in diffusers. Please install a compatible diffusers version (e.g., 0.20.x).") from e
 
-def inject_lora_into_unet(unet, rank=4):
-    """
-    Inject LoRA processors into UNet attention layers (latest diffusers API).
-    Returns AttnProcsLayers containing LoRA weights.
-    """
-    attn_procs = {}
+def inject_lora_to_unet(unet, rank=4, alpha=16, dropout=0.0, device="cuda"):
+    LoRAClass = get_lora_attn_processor_class()
+    lora_state = {}
+    for name, module in unet.named_modules():
+        if "attn" in name or "attention" in name:
+            try:
+                hidden_size = None
+                cross_attention_dim = None
+                if hasattr(module, "to_q"):
+                    hidden_size = getattr(module, "to_q").in_features
+                elif hasattr(module, "query"):
+                    hidden_size = getattr(module, "query").in_features
+                else:
+                    hidden_size = getattr(unet.config, "sample_size", None) or (getattr(unet.config, "block_out_channels", [-1])[-1])
+                proc = LoRAClass(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, rank=rank, alpha=alpha, dropout=dropout)
+                replaced = False
+                for attr in ["processor", "attn1_processor", "attn2_processor"]:
+                    if hasattr(module, attr):
+                        setattr(module, attr, proc)
+                        replaced = True
+                if not replaced:
+                    parts = name.split(".")
+                    try:
+                        cur = unet
+                        for p in parts[:-1]:
+                            cur = getattr(cur, p)
+                        setattr(cur, parts[-1], proc)
+                        replaced = True
+                    except Exception:
+                        replaced = False
+                if replaced:
+                    lora_state[name] = proc
+            except Exception:
+                continue
+    return lora_state
 
-    for name, _ in unet.attn_processors.items():
-        # cross-attn or self-attn
-        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name.split(".")[1])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name.split(".")[1])
-            hidden_size = unet.config.block_out_channels[block_id]
-        else:
-            raise ValueError(f"Cannot determine hidden size for {name}")
-
-        attn_procs[name] = LoRAAttnProcessor2_0(
-            hidden_size=hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            rank=rank
-        )
-
-    unet.set_attn_processor(attn_procs)
-    return AttnProcsLayers(unet.attn_processors)
+def collect_lora_parameters(lora_state):
+    params = []
+    for name, module in lora_state.items():
+        for p in module.parameters():
+            if p.requires_grad:
+                params.append(p)
+    return params
