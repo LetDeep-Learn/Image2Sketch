@@ -30,3 +30,6 @@ image2sketch/
 ├── utils.py             # preprocessing, logging, saving
 ├── requirements.txt
 ├── README.md
+
+
+#git repo https://github.com/LetDeep-Learn/Image2Sketch.git

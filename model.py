@@ -28,7 +28,7 @@ def inject_lora_into_unet(pipe, rank=8):
         if hasattr(module, "set_processor"):
             hidden_size = getattr(module, "to_q").in_features
             cross_attn_dim = getattr(pipe.unet.config, "cross_attention_dim", None)
-            proc = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attn_dim, rank=rank)
+            proc = LoRAAttnProcessor(rank=rank)
             module.set_processor(proc)
 
     attn_procs = pipe.unet.attn_processors
