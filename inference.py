@@ -70,7 +70,8 @@ INPUT_IMAGE = "data/images/img3.png"   # your source image
 OUTPUT_IMAGE = "data/images/output_sketch.png"               # save result
 DEVICE = "cuda"
 IMG_SIZE = (512, 512)                             # resize input image if needed
-PROMPT = "sketch of the given image"
+PROMPT = "convert given image to pencil sketch, preserve shadows and perspective, fine line details"
+
 STRENGTH = 0.7                                    # 0 = preserve input, 1 = redraw completely
 GUIDANCE_SCALE = 7.5                              # classifier-free guidance
 NUM_INFERENCE_STEPS = 50

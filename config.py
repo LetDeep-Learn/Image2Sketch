@@ -21,8 +21,8 @@ class Config:
     GRAD_ACCUMULATE = 1
     SEED = 42
 
-    LORA_RANK = 8   ## 4 if not work
-    LORA_ALPHA = 32  ## 16
+    LORA_RANK = 32   ## 4 if not work
+    LORA_ALPHA = 64  ## 16
     LORA_DROPOUT = 0.1  ## 0.0
 
     SCHEDULER = "ddpm"
