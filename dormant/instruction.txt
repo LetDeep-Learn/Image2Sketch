@@ -1,0 +1,48 @@
+# Image Pairing Logic Summary
+
+This document defines an unambiguous procedure for matching each photograph with its corresponding sketches in our dataset. By following these rules, an LLM can generate code that reliably produces (photo, sketch) pairs without errors.
+
+## Objective
+
+The goal is to construct a list of tuples `(photo_path, sketch_path)` such that every photo is paired with all of its associated sketches. This enables supervised training of image‐to‐image models.
+
+## Dataset Structure
+
+Our dataset is organized into category subfolders.  
+- Each category folder contains photo files and a parallel sketch folder.  
+- There are 125 categories, 12,500 unique photographic objects, and 75,471 hand‐drawn sketches in total.
+
+## Filename Convention
+
+- Photo files:  
+  - Format: `<category>_<objectID>.<ext>`  
+  - Example: `bicycle_00123.jpg`  
+- Sketch files:  
+  - Format: `<category>_<objectID>_<sketchIndex>.<ext>`  
+  - Example: `bicycle_00123_2.png`  
+
+Ensuring consistent naming lets code extract the same `objectID` from photo and sketch filenames.
+
+## Pairing Algorithm
+
+1. Traverse each category’s photo directory and list all photo filenames.  
+2. For each photo filename:  
+   a. Split on underscores and extract the `objectID` segment.  
+   b. Determine the matching sketch directory for that category.  
+3. Inside the sketch directory, list all files whose prefix matches `<category>_<objectID>_`.  
+4. For every matching sketch file, append `(photo_path, sketch_path)` to the output list.  
+5. (Optional) If balancing is required, sample or upsample sketches per photo to ensure uniform representation.
+
+## Error Handling and Best Practices
+
+- Enforce case-sensitive matching on `category` and `objectID`.  
+- Normalize file extensions (e.g., `.jpg` vs `.jpeg`) before matching.  
+- Validate that every photo yields at least one sketch; log or flag missing pairs.  
+- Use absolute or well-defined relative paths to avoid I/O errors.
+
+---
+
+Next Steps:  
+- Generate a reference implementation of a Python `Dataset` class using this logic.  
+- Discuss performance optimizations for large-scale file traversal or parallel I/O.  
+- Explore sampling strategies to address sketch imbalance across objects.
