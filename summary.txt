@@ -1,0 +1,124 @@
+Got it 👍 I’ll rewrite the whole project summary **in pure plain text** (no special windows, no code formatting blocks, no highlighting).
+
+---
+
+PROJECT SUMMARY — Stable Diffusion 1.5 LoRA Training
+
+File Structure:
+
+* config.py : holds constants and hyperparameters
+* dataset.py : dataset class for loading training images
+* model.py : loads base pipeline and injects LoRA into UNet
+* train.py : main training loop
+* inference.py : (optional) for generating images with trained LoRA
+* output/ : directory for saving LoRA checkpoints and final weights
+
+---
+
+config.py variables:
+
+* MODEL\_ID = "runwayml/stable-diffusion-v1-5"
+* DATA\_DIR = dataset path
+* OUTPUT\_DIR = directory for checkpoints and weights
+* DEVICE = "cuda"
+* IMG\_SIZE = training resolution (example 512)
+* BATCH\_SIZE = training batch size
+* LR = learning rate
+* MAX\_STEPS = total training steps
+* WARMUP\_STEPS = warmup steps for scheduler
+* LORA\_RANK = rank of LoRA adapters
+* CHECKPOINT\_EVERY = how often to save checkpoints
+* MIXED\_PRECISION = "fp16" or "bf16"
+* TRAINING\_CAPTION = static caption used for dataset samples
+
+---
+
+dataset.py:
+Class SketchDataset
+
+* Arguments: data\_dir, size
+* Loads images from data\_dir
+* Applies resize and normalization
+* Returns dictionary with key "pixel\_values" mapped to tensor
+
+---
+
+model.py:
+Function load\_base\_pipeline(model\_id, device, dtype)
+
+* Loads StableDiffusionPipeline from pretrained model\_id
+* Moves to device with dtype
+* Disables safety checker
+* Replaces scheduler with DDPMScheduler
+* Enables memory helpers (vae tiling and attention slicing)
+* Returns pipeline
+
+Function inject\_lora\_into\_unet(unet, rank)
+
+* Iterates over unet attention processor names
+* Determines hidden\_size based on block type
+
+  * mid\_block uses last channel
+  * up\_blocks uses reversed channel index
+  * down\_blocks uses forward channel index
+* cross\_attention\_dim is None for self-attention, otherwise from unet config
+* Creates LoRAAttnProcessor with hidden\_size, cross\_attention\_dim, and rank
+* Collects processors into container (LoRA layers)
+* Returns container of LoRA layers (trainable parameters)
+
+---
+
+train.py:
+Workflow
+
+1. Create output directory
+2. Load base pipeline using load\_base\_pipeline
+3. Freeze unet, text\_encoder, vae (no gradients)
+4. Inject LoRA adapters into unet
+5. Collect only LoRA parameters into optimizer (AdamW)
+6. Use cosine scheduler with warmup
+7. Load dataset using SketchDataset and DataLoader
+8. Training loop:
+
+   * Encode images to latents with VAE (no grad)
+   * Add noise using DDPMScheduler
+   * Tokenize captions and get embeddings with text encoder
+   * Pass through unet with LoRA active
+   * Compute MSE loss between predicted noise and true noise
+   * Backpropagation with mixed precision scaler
+   * Optimizer step, scheduler step
+   * Every few steps save LoRA checkpoint into output directory
+9. After final step, save LoRA weights into OUTPUT\_DIR
+
+Important variables:
+
+* step = current training step
+* scaler = AMP gradient scaler
+* pbar = tqdm progress bar
+* checkpoints saved in output/checkpoint-step-N
+* final saved as output/lora\_weights.pt
+
+---
+
+inference.py (planned):
+
+* Load base pipeline with load\_base\_pipeline
+* Inject LoRA into unet
+* Load LoRA weights using torch.load and load\_state\_dict
+* Generate images with prompt
+
+---
+
+Key Concepts:
+
+* StableDiffusionPipeline v1.5 is the backbone
+* Only LoRA adapters inside unet attention layers are trainable
+* unet base, vae, and text encoder are frozen
+* Training output is lora\_weights.pt which is a PyTorch state dict
+* Saving and loading done with torch.save and load\_state\_dict (not Hugging Face save\_pretrained)
+
+---
+
+This is the complete plain-text summary of your project.
+
+Do you want me to now also prepare the plain-text version of inference.py that matches this setup?
