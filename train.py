@@ -8,13 +8,12 @@ from torch import amp
 from torch.optim.lr_scheduler import LambdaLR
 
 from config import cfg
-from dataset import ImageCaptionDataset, collate_fn
-# from model import load_base_pipeline, inject_lora_to_unet, collect_lora_parameters
+from dataset import ImageDataset, collate_fn
 from model import (
     load_base_pipeline,
     inject_lora_to_unet_by_replacing_linears,
     collect_lora_parameters_from_unet,
-    save_lora_state,  # for saving during training
+    save_lora_state,
 )
 
 def seed_everything(seed=42):
@@ -23,13 +22,7 @@ def seed_everything(seed=42):
     torch.cuda.manual_seed_all(seed)
 
 def save_lora_state(lora_state, path):
-    sd = {}
-    for name, mod in lora_state.items():
-        try:
-            sd[name] = mod.state_dict()
-        except Exception:
-            sd[name] = {k: v for k, v in mod.__dict__.items() if hasattr(v, 'state_dict')}
-    torch.save(sd, path)
+    torch.save({k: v.state_dict() for k, v in lora_state.items()}, path)
 
 def main():
     seed_everything(cfg.SEED)
@@ -45,27 +38,21 @@ def main():
     pipe = load_base_pipeline(cfg.MODEL_ID, device=cfg.DEVICE, dtype=dtype, use_auth_token=cfg.HF_TOKEN)
     unet = pipe.unet
     vae = pipe.vae
-    text_encoder = pipe.text_encoder
-    tokenizer = pipe.tokenizer
 
+    # Freeze everything except LoRA adapters
     for p in unet.parameters():
         p.requires_grad = False
     for p in vae.parameters():
         p.requires_grad = False
-    for p in text_encoder.parameters():
-        p.requires_grad = False
 
-    # old:
-    # lora_state = inject_lora_to_unet(unet, rank=cfg.LORA_RANK, alpha=cfg.LORA_ALPHA, dropout=cfg.LORA_DROPOUT, device=cfg.DEVICE)
-    # trainable_params = collect_lora_parameters(lora_state)
-
-    # new:
-    lora_map = inject_lora_to_unet_by_replacing_linears(unet, r=cfg.LORA_RANK, alpha=cfg.LORA_ALPHA, dropout=cfg.LORA_DROPOUT)
+    lora_map = inject_lora_to_unet_by_replacing_linears(
+        unet, r=cfg.LORA_RANK, alpha=cfg.LORA_ALPHA, dropout=cfg.LORA_DROPOUT
+    )
     trainable_params, trainable_names = collect_lora_parameters_from_unet(unet)
     print(f"[INFO] LoRA adapter tensors found: {len(trainable_params)}")
     print(f"[INFO] Example adapter param names: {trainable_names[:10]}")
     if len(trainable_params) == 0:
-        raise RuntimeError("No LoRA parameters found to train. Injector likely failed. Run the introspection snippet and paste results.")
+        raise RuntimeError("No LoRA parameters found to train. Injector likely failed.")
 
     optimizer = AdamW(trainable_params, lr=cfg.LR)
 
@@ -76,7 +63,8 @@ def main():
             return max(0.0, float(cfg.MAX_STEPS - step) / float(max(1, cfg.MAX_STEPS - cfg.WARMUP_STEPS)))
     scheduler = LambdaLR(optimizer, lr_lambda)
 
-    dataset = ImageCaptionDataset(cfg.DATA_DIR, img_size=cfg.IMG_SIZE, captions_txt=cfg.CAPTIONS_TXT)
+    # Use dataset that only returns images
+    dataset = ImageDataset(cfg.DATA_DIR, img_size=cfg.IMG_SIZE)
     dataloader = DataLoader(dataset, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=collate_fn, drop_last=True)
 
     scaler = amp.GradScaler(enabled=(cfg.MIXED_PRECISION != "no"))
@@ -94,44 +82,45 @@ def main():
                 break
 
             pixel_values = batch["pixel_values"].to(cfg.DEVICE)
-            captions = batch["captions"]
 
-            tokenized = tokenizer(captions, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
-            tokenized = {k: v.to(cfg.DEVICE) for k,v in tokenized.items()}
+            # Encode with VAE
             with torch.no_grad():
-                text_embeddings = text_encoder(**tokenized).last_hidden_state
-
-            with torch.no_grad():
-                latents = vae.encode(pixel_values.half() if cfg.MIXED_PRECISION=="fp16" else pixel_values).latent_dist.sample() * vae.config.scaling_factor
+                latents = vae.encode(
+                    pixel_values.half() if cfg.MIXED_PRECISION == "fp16" else pixel_values
+                ).latent_dist.sample() * vae.config.scaling_factor
 
             noise = torch.randn_like(latents)
             try:
-                timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device).long()
+                timesteps = torch.randint(
+                    0, pipe.scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device
+                ).long()
             except Exception:
                 timesteps = torch.randint(0, 1000, (latents.shape[0],), device=latents.device).long()
             noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
 
             optimizer.zero_grad()
             with amp.autocast(device_type="cuda", enabled=(cfg.MIXED_PRECISION != "no")):
+                # Empty text embeddings → unconditional
+                batch_size = latents.shape[0]
+                hidden_size = unet.config.cross_attention_dim
+                text_embeddings = torch.zeros(
+                    (batch_size, 1, hidden_size), device=cfg.DEVICE, dtype=latents.dtype
+                )
+
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states=text_embeddings).sample
                 loss = torch.nn.functional.mse_loss(model_pred.float(), noise.float(), reduction="mean")
                 loss_to_backprop = loss / cfg.GRAD_ACCUMULATE
 
             scaler.scale(loss_to_backprop).backward()
             if (global_step + 1) % cfg.GRAD_ACCUMULATE == 0:
-                # Try to unscale; if PyTorch complains about FP16 grads, skip unscale and clipping.
                 try:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-                except ValueError as e:
-                    # This happens when gradients are FP16 and can't be unscaled.
-                    # Skip clipping for this step (optimizer.step will internally unscale).
+                except ValueError:
                     print("[WARNING] scaler.unscale_ failed (likely FP16 grads). Skipping gradient clipping for this step.")
-                # Step and update scaler as usual
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
-
 
             global_step += 1
             pbar.update(1)
@@ -150,7 +139,6 @@ def main():
     if cfg.SAVE_FINAL:
         final_path = os.path.join(cfg.OUTPUT_DIR, "lora_final.pt")
         save_lora_state(unet, final_path)
-
 
     print("Training finished. LoRA saved to", cfg.OUTPUT_DIR)
 
