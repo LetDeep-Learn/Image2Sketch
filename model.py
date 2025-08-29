@@ -1,38 +1,73 @@
 # model.py
 import torch
+import torch.nn as nn
 from diffusers import StableDiffusionPipeline, DDPMScheduler
-from diffusers.models.attention_processor import LoRAAttnProcessor
-from diffusers.loaders import AttnProcsLayers
 
-def load_base_pipeline(model_id, device="cuda", dtype=torch.float16):
+
+# -------------------------------
+# Simple LoRA Linear wrapper
+# -------------------------------
+class LoRALinear(nn.Module):
+    def __init__(self, orig_linear, rank=4, alpha=1.0):
+        super().__init__()
+        self.orig_linear = orig_linear
+        self.rank = rank
+        self.alpha = alpha
+
+        self.lora_down = nn.Linear(orig_linear.in_features, rank, bias=False)
+        self.lora_up = nn.Linear(rank, orig_linear.out_features, bias=False)
+
+        # init
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=5**0.5)
+        nn.init.zeros_(self.lora_up.weight)
+
+    def forward(self, x):
+        return self.orig_linear(x) + self.lora_up(self.lora_down(x)) * (self.alpha / self.rank)
+
+
+# -------------------------------
+# Load Base SD1.5 Pipeline
+# -------------------------------
+def load_base_pipeline(model_id="runwayml/stable-diffusion-v1-5", device="cuda", dtype=torch.float16):
     pipe = StableDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=dtype,
     )
     pipe = pipe.to(device)
     pipe.safety_checker = None
-    # Use scheduler config friendly for training
+
+    # use training-friendly scheduler
     pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+
     # memory helpers
-    pipe.enable_vae_tiling()
-    pipe.enable_attention_slicing()
+    if hasattr(pipe, "enable_vae_tiling"):
+        pipe.enable_vae_tiling()
+    if hasattr(pipe, "enable_attention_slicing"):
+        pipe.enable_attention_slicing()
+
     return pipe
 
-def inject_lora_into_unet(pipe, rank=8):
-    """
-    Attach LoRA processors to every attention module with set_processor
-    Returns the AttnProcsLayers wrapper which can be saved/loaded.
-    """
-    # iterate modules and attach LoRAAttnProcessor where possible
-    for name, module in pipe.unet.named_modules():
-        if hasattr(module, "set_processor"):
-            hidden_size = getattr(module, "to_q").in_features
-            cross_attn_dim = getattr(pipe.unet.config, "cross_attention_dim", None)
-            proc = LoRAAttnProcessor(rank=rank)
-            module.set_processor(proc)
 
-    attn_procs = pipe.unet.attn_processors
-    lora_layers = AttnProcsLayers(attn_procs)  # wrapper object
-    return lora_layers
+# -------------------------------
+# Inject LoRA into UNet (diffusers 0.14.0 compatible)
+# -------------------------------
+def inject_lora_into_unet(unet, rank=4, alpha=1.0):
+    """
+    Replace Linear layers in attention with LoRA-wrapped layers.
+    Returns nn.ModuleList of trainable LoRA layers.
+    """
+    lora_layers = []
 
-    
+    for name, module in unet.named_modules():
+        if isinstance(module, nn.Linear):
+            parent = unet
+            *path, last = name.split(".")
+            for p in path:
+                parent = getattr(parent, p)
+
+            orig_linear = getattr(parent, last)
+            lora_linear = LoRALinear(orig_linear, rank=rank, alpha=alpha)
+            setattr(parent, last, lora_linear)
+            lora_layers.append(lora_linear)
+
+    return nn.ModuleList(lora_layers)
