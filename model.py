@@ -1,73 +1,57 @@
 # model.py
 import torch
-import torch.nn as nn
 from diffusers import StableDiffusionPipeline, DDPMScheduler
+from diffusers.models.attention_processor import LoRAAttnProcessor2_0
+from diffusers.loaders import AttnProcsLayers
 
-
-# -------------------------------
-# Simple LoRA Linear wrapper
-# -------------------------------
-class LoRALinear(nn.Module):
-    def __init__(self, orig_linear, rank=4, alpha=1.0):
-        super().__init__()
-        self.orig_linear = orig_linear
-        self.rank = rank
-        self.alpha = alpha
-
-        self.lora_down = nn.Linear(orig_linear.in_features, rank, bias=False)
-        self.lora_up = nn.Linear(rank, orig_linear.out_features, bias=False)
-
-        # init
-        nn.init.kaiming_uniform_(self.lora_down.weight, a=5**0.5)
-        nn.init.zeros_(self.lora_up.weight)
-
-    def forward(self, x):
-        return self.orig_linear(x) + self.lora_up(self.lora_down(x)) * (self.alpha / self.rank)
-
-
-# -------------------------------
-# Load Base SD1.5 Pipeline
-# -------------------------------
-def load_base_pipeline(model_id="runwayml/stable-diffusion-v1-5", device="cuda", dtype=torch.float16):
+def load_base_pipeline(model_id, device="cuda", dtype=torch.float16):
+    """
+    Load Stable Diffusion pipeline with scheduler set for training.
+    Compatible with latest diffusers.
+    """
     pipe = StableDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=dtype,
+        safety_checker=None  # disable NSFW filter for training
     )
     pipe = pipe.to(device)
-    pipe.safety_checker = None
 
-    # use training-friendly scheduler
+    # Use DDPM scheduler for training
     pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
 
-    # memory helpers
-    if hasattr(pipe, "enable_vae_tiling"):
-        pipe.enable_vae_tiling()
-    if hasattr(pipe, "enable_attention_slicing"):
-        pipe.enable_attention_slicing()
-
+    # Memory helpers
+    pipe.enable_vae_tiling()
+    pipe.enable_attention_slicing()
     return pipe
 
 
-# -------------------------------
-# Inject LoRA into UNet (diffusers 0.14.0 compatible)
-# -------------------------------
-def inject_lora_into_unet(unet, rank=4, alpha=1.0):
+def inject_lora_into_unet(unet, rank=4):
     """
-    Replace Linear layers in attention with LoRA-wrapped layers.
-    Returns nn.ModuleList of trainable LoRA layers.
+    Inject LoRA processors into UNet attention layers (latest diffusers API).
+    Returns AttnProcsLayers containing LoRA weights.
     """
-    lora_layers = []
+    attn_procs = {}
 
-    for name, module in unet.named_modules():
-        if isinstance(module, nn.Linear):
-            parent = unet
-            *path, last = name.split(".")
-            for p in path:
-                parent = getattr(parent, p)
+    for name, _ in unet.attn_processors.items():
+        # cross-attn or self-attn
+        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
 
-            orig_linear = getattr(parent, last)
-            lora_linear = LoRALinear(orig_linear, rank=rank, alpha=alpha)
-            setattr(parent, last, lora_linear)
-            lora_layers.append(lora_linear)
+        if name.startswith("mid_block"):
+            hidden_size = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name.split(".")[1])
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name.split(".")[1])
+            hidden_size = unet.config.block_out_channels[block_id]
+        else:
+            raise ValueError(f"Cannot determine hidden size for {name}")
 
-    return nn.ModuleList(lora_layers)
+        attn_procs[name] = LoRAAttnProcessor2_0(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=rank
+        )
+
+    unet.set_attn_processor(attn_procs)
+    return AttnProcsLayers(unet.attn_processors)
