@@ -6,9 +6,9 @@ class Config:
     MODEL_ID = "runwayml/stable-diffusion-v1-5"
     HF_TOKEN = None
 
-    DATA_DIR = "dataset"
-    CAPTIONS_TXT = None
-    OUTPUT_DIR = "output"
+    DATA_DIR = "data/sketches"
+    CAPTIONS_TXT = "pencil sketch, clean line art, black and white, no shading, high contrast"
+    OUTPUT_DIR = "/content/drive/MyDrive/image2sketch/checkpoints"
 
     DEVICE = "cuda"
     IMG_SIZE = 512

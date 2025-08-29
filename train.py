@@ -4,12 +4,18 @@ import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.cuda.amp import autocast, GradScaler
+from torch import amp
 from torch.optim.lr_scheduler import LambdaLR
 
 from config import cfg
 from dataset import ImageCaptionDataset, collate_fn
-from model import load_base_pipeline, inject_lora_to_unet, collect_lora_parameters
+# from model import load_base_pipeline, inject_lora_to_unet, collect_lora_parameters
+from model import (
+    load_base_pipeline,
+    inject_lora_to_unet_by_replacing_linears,
+    collect_lora_parameters_from_unet,
+    save_lora_state,  # for saving during training
+)
 
 def seed_everything(seed=42):
     random.seed(seed)
@@ -49,10 +55,17 @@ def main():
     for p in text_encoder.parameters():
         p.requires_grad = False
 
-    lora_state = inject_lora_to_unet(unet, rank=cfg.LORA_RANK, alpha=cfg.LORA_ALPHA, dropout=cfg.LORA_DROPOUT, device=cfg.DEVICE)
-    trainable_params = collect_lora_parameters(lora_state)
+    # old:
+    # lora_state = inject_lora_to_unet(unet, rank=cfg.LORA_RANK, alpha=cfg.LORA_ALPHA, dropout=cfg.LORA_DROPOUT, device=cfg.DEVICE)
+    # trainable_params = collect_lora_parameters(lora_state)
+
+    # new:
+    lora_map = inject_lora_to_unet_by_replacing_linears(unet, r=cfg.LORA_RANK, alpha=cfg.LORA_ALPHA, dropout=cfg.LORA_DROPOUT)
+    trainable_params, trainable_names = collect_lora_parameters_from_unet(unet)
+    print(f"[INFO] LoRA adapter tensors found: {len(trainable_params)}")
+    print(f"[INFO] Example adapter param names: {trainable_names[:10]}")
     if len(trainable_params) == 0:
-        raise RuntimeError("No LoRA parameters found to train. Check diffusers version or injection logic.")
+        raise RuntimeError("No LoRA parameters found to train. Injector likely failed. Run the introspection snippet and paste results.")
 
     optimizer = AdamW(trainable_params, lr=cfg.LR)
 
@@ -66,7 +79,7 @@ def main():
     dataset = ImageCaptionDataset(cfg.DATA_DIR, img_size=cfg.IMG_SIZE, captions_txt=cfg.CAPTIONS_TXT)
     dataloader = DataLoader(dataset, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=collate_fn, drop_last=True)
 
-    scaler = GradScaler(enabled=(cfg.MIXED_PRECISION != "no"))
+    scaler = amp.GradScaler(enabled=(cfg.MIXED_PRECISION != "no"))
 
     global_step = 0
     pbar = tqdm(total=cfg.MAX_STEPS)
@@ -99,18 +112,26 @@ def main():
             noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
 
             optimizer.zero_grad()
-            with autocast(enabled=(cfg.MIXED_PRECISION!="no")):
+            with amp.autocast(device_type="cuda", enabled=(cfg.MIXED_PRECISION != "no")):
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states=text_embeddings).sample
                 loss = torch.nn.functional.mse_loss(model_pred.float(), noise.float(), reduction="mean")
                 loss_to_backprop = loss / cfg.GRAD_ACCUMULATE
 
             scaler.scale(loss_to_backprop).backward()
             if (global_step + 1) % cfg.GRAD_ACCUMULATE == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                # Try to unscale; if PyTorch complains about FP16 grads, skip unscale and clipping.
+                try:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                except ValueError as e:
+                    # This happens when gradients are FP16 and can't be unscaled.
+                    # Skip clipping for this step (optimizer.step will internally unscale).
+                    print("[WARNING] scaler.unscale_ failed (likely FP16 grads). Skipping gradient clipping for this step.")
+                # Step and update scaler as usual
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
+
 
             global_step += 1
             pbar.update(1)
@@ -118,7 +139,7 @@ def main():
 
             if global_step % cfg.CHECKPOINT_EVERY == 0 or global_step >= cfg.MAX_STEPS:
                 ckpt_path = os.path.join(cfg.OUTPUT_DIR, f"lora_checkpoint_step_{global_step}.pt")
-                save_lora_state(lora_state, ckpt_path)
+                save_lora_state(unet, ckpt_path)
 
             if global_step >= cfg.MAX_STEPS:
                 break
@@ -128,7 +149,8 @@ def main():
 
     if cfg.SAVE_FINAL:
         final_path = os.path.join(cfg.OUTPUT_DIR, "lora_final.pt")
-        save_lora_state(lora_state, final_path)
+        save_lora_state(unet, final_path)
+
 
     print("Training finished. LoRA saved to", cfg.OUTPUT_DIR)
 
